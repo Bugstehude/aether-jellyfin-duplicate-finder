@@ -1,0 +1,12 @@
+bin/
+obj/
+artifacts/
+.idea/
+.vscode/settings.json
+*.user
+*.suo
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+TestResults/
+coverage/

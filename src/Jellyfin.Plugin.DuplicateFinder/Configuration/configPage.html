@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AETHER Duplicate Finder</title>
+</head>
+<body>
+  <div id="DuplicateFinderConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+      <div class="content-primary">
+        <form id="DuplicateFinderConfigForm">
+          <h1>AETHER Duplicate Finder</h1>
+          <p>Finds duplicate video files by actual file content — exact copies first (identical file hash), never guessing from titles or metadata. Nothing is ever deleted automatically: results are listed here for you to review, and deletion always needs an explicit, confirmed click.</p>
+
+          <h2>Scope</h2>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused">Libraries/folders to scan</label>
+            <div id="ScanScopes" style="margin-top:0.4em;"></div>
+            <div class="fieldDescription">Nothing ticked = every library. Tick a whole library, or click ▸ next to it to narrow the scan down to specific subfolders (leave the library itself unticked in that case).</div>
+          </div>
+          <button is="emby-button" type="submit" class="raised block"><span>Save scope</span></button>
+
+          <h2 style="margin-top:1.5em;">Scan</h2>
+          <div style="display:flex; align-items:center; gap:1em; flex-wrap:wrap;">
+            <button is="emby-button" type="button" id="ScanButton" class="raised button-submit"><span>Scan now</span></button>
+            <span id="ScanState" style="opacity:0.85;">…</span>
+          </div>
+          <div id="ScanBarWrap" style="height:6px; background:rgba(128,128,128,0.25); border-radius:3px; margin:0.6em 0; overflow:hidden; display:none;">
+            <div id="ScanBar" style="height:100%; width:0%; background:#00a4dc; transition:width 0.4s ease;"></div>
+          </div>
+
+          <h2 style="margin-top:1.5em;">Duplicates found</h2>
+          <p class="fieldDescription">Click a row to focus it, then: <strong>Space</strong> marks/unmarks it for deletion, <strong>↑/↓</strong> moves between files, <strong>Enter</strong> deletes everything currently marked (with a confirmation), <strong>Escape</strong> clears all marks.</p>
+          <div id="DuplicateGroups"></div>
+        </form>
+      </div>
+    </div>
+  <script type="text/javascript">
+    (() => {
+      const pluginId = 'deaef2b1-2ebd-4021-91b4-17582b992db2';
+      const page = document.querySelector('#DuplicateFinderConfigPage');
+      const form = document.querySelector('#DuplicateFinderConfigForm');
+      // Same reason as the AETHER Analysis plugin's config page: this script must live
+      // INSIDE .pluginConfigurationPage, or Jellyfin's view loader drops it silently.
+      const get = (config, name, fallback) => {
+        const camel = name.charAt(0).toLowerCase() + name.slice(1);
+        const value = config == null ? undefined : (config[name] ?? config[camel]);
+        return value === undefined || value === null ? fallback : value;
+      };
+      const set = (config, name, value) => {
+        const camel = name.charAt(0).toLowerCase() + name.slice(1);
+        if (camel !== name && Object.prototype.hasOwnProperty.call(config, camel)) {
+          delete config[camel];
+        }
+        config[name] = value;
+      };
+
+      // --- Scope picker: same recursive folder-drill-down pattern as the AETHER Analysis
+      // plugin's "Libraries to analyze" (v0.2.6.0) — ApiClient.getItems, one level at a time,
+      // lazily expanded. See that plugin's configPage.html for the original write-up of why.
+      const scopesEl = document.querySelector('#ScanScopes');
+      const renderScopeChoices = async (selectedIds) => {
+        const selected = new Set((selectedIds || []).map(String));
+        scopesEl.textContent = 'Loading libraries…';
+        let folders;
+        try {
+          folders = await ApiClient.getVirtualFolders();
+        } catch (error) {
+          scopesEl.textContent = 'Could not load libraries — save still works with the previous selection.';
+          return;
+        }
+        scopesEl.textContent = '';
+        const known = new Set();
+        const addRow = (parentEl, id, name, checked, depth) => {
+          known.add(String(id));
+          const row = document.createElement('div');
+          row.style.margin = '0.25em 0';
+          row.style.marginLeft = (depth * 1.5) + 'em';
+
+          const toggle = document.createElement('span');
+          toggle.textContent = '▸';
+          toggle.title = 'Show subfolders';
+          toggle.style.display = 'inline-block';
+          toggle.style.width = '1.1em';
+          toggle.style.cursor = 'pointer';
+          toggle.style.userSelect = 'none';
+          toggle.style.opacity = '0.75';
+          row.appendChild(toggle);
+
+          const label = document.createElement('label');
+          label.style.display = 'inline';
+          label.style.cursor = 'pointer';
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.className = 'dupScopeCheck';
+          box.value = String(id);
+          box.checked = checked;
+          box.style.marginRight = '0.5em';
+          label.appendChild(box);
+          const span = document.createElement('span');
+          span.textContent = name;
+          label.appendChild(span);
+          row.appendChild(label);
+          parentEl.appendChild(row);
+
+          const childrenEl = document.createElement('div');
+          parentEl.appendChild(childrenEl);
+          let loaded = false;
+          toggle.addEventListener('click', async () => {
+            if (loaded) {
+              const collapsed = childrenEl.style.display === 'none';
+              childrenEl.style.display = collapsed ? '' : 'none';
+              toggle.textContent = collapsed ? '▾' : '▸';
+              return;
+            }
+            loaded = true;
+            toggle.textContent = '▾';
+            childrenEl.textContent = 'Loading…';
+            let children;
+            try {
+              const result = await ApiClient.getItems(ApiClient.getCurrentUserId(), {
+                ParentId: id,
+                IncludeItemTypes: 'Folder',
+                Recursive: false,
+                SortBy: 'SortName',
+              });
+              children = result.Items || [];
+            } catch (error) {
+              childrenEl.textContent = 'Could not load subfolders.';
+              return;
+            }
+            childrenEl.textContent = '';
+            if (!children.length) {
+              childrenEl.textContent = '(no subfolders)';
+              childrenEl.style.marginLeft = ((depth + 1) * 1.5) + 'em';
+              childrenEl.style.opacity = '0.7';
+              return;
+            }
+            children.forEach(child => addRow(childrenEl, child.Id, child.Name, selected.has(String(child.Id)), depth + 1));
+          });
+        };
+        (folders || []).forEach(folder => addRow(scopesEl, folder.ItemId, folder.Name, selected.has(String(folder.ItemId)), 0));
+        (selectedIds || []).map(String).forEach(id => {
+          if (!known.has(id)) { addRow(scopesEl, id, '(removed library ' + id + ')', true, 0); }
+        });
+        if (!scopesEl.children.length) { scopesEl.textContent = 'No libraries found on this server.'; }
+      };
+
+      const loadConfiguration = async () => {
+        Dashboard.showLoadingMsg();
+        try {
+          const config = await ApiClient.getPluginConfiguration(pluginId);
+          await renderScopeChoices(get(config, 'ScanScopeIds', []));
+        } catch (error) {
+          console.error('AETHER Duplicate Finder: failed to load plugin configuration', error);
+        } finally {
+          Dashboard.hideLoadingMsg();
+        }
+      };
+      page.addEventListener('pageshow', loadConfiguration);
+      loadConfiguration();
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        Dashboard.showLoadingMsg();
+        const config = await ApiClient.getPluginConfiguration(pluginId);
+        set(config, 'ScanScopeIds', Array.from(document.querySelectorAll('.dupScopeCheck'))
+          .filter(box => box.checked).map(box => box.value));
+        await ApiClient.updatePluginConfiguration(pluginId, config);
+        Dashboard.processPluginConfigurationUpdateResult();
+      });
+
+      // --- Scan trigger + progress poll ---------------------------------------------
+      const scanUrl = ApiClient.getUrl('DuplicateFinder/v1/scan');
+      const statusUrl = ApiClient.getUrl('DuplicateFinder/v1/scan/status');
+      const groupsUrl = ApiClient.getUrl('DuplicateFinder/v1/groups');
+      const deleteUrl = ApiClient.getUrl('DuplicateFinder/v1/delete');
+
+      const bytes = (n) => {
+        if (!n) { return '0 B'; }
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+        return (n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+      };
+      const duration = (s) => {
+        if (!s) { return '?'; }
+        const total = Math.round(s);
+        return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+      };
+
+      const groupsEl = document.querySelector('#DuplicateGroups');
+      // Flat list of every rendered file-row checkbox, in document order, for keyboard nav.
+      let rowCheckboxes = [];
+
+      const renderGroups = (groups) => {
+        groupsEl.textContent = '';
+        rowCheckboxes = [];
+        if (!groups || !groups.length) {
+          groupsEl.textContent = 'No duplicates found yet — run a scan above.';
+          return;
+        }
+        groups.forEach((group) => {
+          const box = document.createElement('div');
+          box.style.margin = '0.75em 0';
+          box.style.padding = '0.6em 0.8em';
+          box.style.border = '1px solid rgba(128,128,128,0.4)';
+          box.style.borderRadius = '6px';
+
+          const heading = document.createElement('div');
+          heading.style.opacity = '0.75';
+          heading.style.fontSize = '0.8em';
+          heading.style.marginBottom = '0.4em';
+          heading.textContent = group.Files.length + ' identical files (sha256 ' + group.Sha256.slice(0, 12) + '…)';
+          box.appendChild(heading);
+
+          // Recommend keeping the largest file (same encode ⇒ identical hash means all files
+          // in a Tier-1 group ARE the same bytes, so size ties are common; this still gives a
+          // stable, deterministic pick rather than an arbitrary first-in-list one).
+          const biggest = group.Files.reduce((a, b) => (b.SizeBytes > a.SizeBytes ? b : a), group.Files[0]);
+
+          group.Files.forEach((file) => {
+            const row = document.createElement('label');
+            row.style.display = 'flex';
+            row.style.alignItems = 'center';
+            row.style.gap = '0.6em';
+            row.style.padding = '0.3em 0';
+            row.style.cursor = 'pointer';
+
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.dataset.itemId = file.ItemId;
+            rowCheckboxes.push(cb);
+            row.appendChild(cb);
+
+            const info = document.createElement('span');
+            const suggestion = file === biggest ? ' — suggested keep' : '';
+            info.textContent = file.ItemName + '  ·  ' + file.Path + '  ·  '
+              + bytes(file.SizeBytes) + '  ·  '
+              + (file.Width && file.Height ? file.Width + '×' + file.Height + '  ·  ' : '')
+              + duration(file.DurationSeconds) + (file.Codec ? '  ·  ' + file.Codec : '')
+              + suggestion;
+            info.style.fontSize = '0.85em';
+            row.appendChild(info);
+
+            box.appendChild(row);
+          });
+          groupsEl.appendChild(box);
+        });
+      };
+
+      const loadGroups = async () => {
+        try {
+          const groups = await ApiClient.ajax({ type: 'GET', url: groupsUrl, dataType: 'json' });
+          renderGroups(groups);
+        } catch (error) {
+          groupsEl.textContent = 'Could not load duplicate groups.';
+        }
+      };
+
+      const renderScanState = (status) => {
+        const stateEl = document.querySelector('#ScanState');
+        const barWrap = document.querySelector('#ScanBarWrap');
+        const bar = document.querySelector('#ScanBar');
+        if (status.running) {
+          stateEl.textContent = 'Scanning… ' + status.checked + '/' + status.total;
+          barWrap.style.display = status.total > 0 ? 'block' : 'none';
+          bar.style.width = status.total > 0 ? Math.round((status.checked / status.total) * 100) + '%' : '0%';
+        } else {
+          barWrap.style.display = 'none';
+          stateEl.textContent = status.lastError
+            ? 'Last scan failed: ' + status.lastError
+            : (status.lastFinishedAt
+              ? status.lastGroupCount + ' duplicate group(s) found · last scan ' + new Date(status.lastFinishedAt).toLocaleString()
+              : 'Never scanned yet.');
+        }
+      };
+
+      let pollTimer = null;
+      const pollStatus = async () => {
+        try {
+          const status = await ApiClient.ajax({ type: 'GET', url: statusUrl, dataType: 'json' });
+          renderScanState(status);
+          if (!status.running && pollTimer !== null) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            await loadGroups();
+          }
+        } catch (error) {
+          document.querySelector('#ScanState').textContent = 'unavailable';
+        }
+      };
+
+      document.querySelector('#ScanButton').addEventListener('click', async () => {
+        await ApiClient.ajax({ type: 'POST', url: scanUrl });
+        if (pollTimer === null) { pollTimer = setInterval(pollStatus, 1000); }
+        pollStatus();
+      });
+
+      pollStatus();
+      loadGroups();
+
+      // --- Keyboard navigation for the results list ---------------------------------
+      // Space to toggle a checkbox is native browser behaviour already — only arrow-key
+      // movement between rows and Enter/Escape need wiring up here.
+      groupsEl.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp'
+          && event.key !== 'Enter' && event.key !== 'Escape') {
+          return;
+        }
+        if (event.key === 'Escape') {
+          rowCheckboxes.forEach(cb => { cb.checked = false; });
+          return;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          void confirmDelete();
+          return;
+        }
+        const current = rowCheckboxes.indexOf(document.activeElement);
+        if (current === -1) { return; }
+        event.preventDefault();
+        const next = event.key === 'ArrowDown'
+          ? Math.min(rowCheckboxes.length - 1, current + 1)
+          : Math.max(0, current - 1);
+        rowCheckboxes[next].focus();
+      });
+
+      const confirmDelete = async () => {
+        const marked = rowCheckboxes.filter(cb => cb.checked);
+        if (!marked.length) { return; }
+        const ok = window.confirm(
+          'Permanently delete ' + marked.length + ' file(s)? This cannot be undone.');
+        if (!ok) { return; }
+        Dashboard.showLoadingMsg();
+        try {
+          await ApiClient.ajax({
+            type: 'POST',
+            url: deleteUrl,
+            data: JSON.stringify({ itemIds: marked.map(cb => cb.dataset.itemId) }),
+            contentType: 'application/json',
+          });
+          await loadGroups();
+        } finally {
+          Dashboard.hideLoadingMsg();
+        }
+      };
+    })();
+  </script>
+  </div>
+</body>
+</html>

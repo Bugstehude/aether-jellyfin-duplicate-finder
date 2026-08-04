@@ -1,0 +1,19 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{cs,csproj,props,sln}]
+indent_style = space
+indent_size = 4
+dotnet_diagnostic.CA1822.severity = none
+dotnet_diagnostic.CA1848.severity = none
+dotnet_diagnostic.CA1859.severity = none
+dotnet_diagnostic.CA1861.severity = none
+
+[*.{json,jsonl,yml,yaml,md}]
+indent_style = space
+indent_size = 2

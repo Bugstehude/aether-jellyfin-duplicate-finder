@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v4.3.1
+        with:
+          dotnet-version: 9.0.304
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            global.json
+      - name: Restore
+        run: dotnet restore --locked-mode
+      - name: Verify release metadata
+        run: python3 tools/verify-release-metadata.py
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+      - name: Verify formatting
+        run: dotnet format --verify-no-changes --no-restore
+      - name: Test
+        run: dotnet test --configuration Release --no-restore --no-build
+      - name: Audit NuGet dependencies
+        run: dotnet list package --include-transitive --vulnerable
+      - name: Build deterministic install archive
+        run: tools/package-plugin.sh
+      - name: Validate Jellyfin repository manifest
+        run: python3 -m json.tool artifacts/package/manifest.json >/dev/null
+      - name: Jellyfin 10.11.11 load smoke test
+        run: tools/smoke-jellyfin.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aether-duplicate-finder-plugin
+          path: |
+            artifacts/package/aether-duplicate-finder-*.zip
+            artifacts/package/aether-duplicate-finder-*.zip.sha256
+            artifacts/package/aether-duplicate-finder-*.cdx.json
+            artifacts/package/manifest.json
+            build.yaml
