@@ -30,7 +30,10 @@
           </div>
 
           <h2 style="margin-top:1.5em;">Duplicates found</h2>
-          <p class="fieldDescription">Click a row to focus it, then: <strong>Space</strong> marks/unmarks it for deletion, <strong>↑/↓</strong> moves between files, <strong>Enter</strong> deletes everything currently marked (with a confirmation), <strong>Escape</strong> clears all marks.</p>
+          <p class="fieldDescription"><strong>Clicking a row marks it for deletion</strong> (so does Space, if you've moved focus there with the keyboard) — it does not just select/focus it. <strong>↑/↓</strong> moves between files, <strong>Enter</strong> or the button below deletes everything currently marked (with a confirmation listing exactly what will go), <strong>Escape</strong> clears all marks without deleting anything.</p>
+          <div style="display:flex; align-items:center; gap:1em; margin-bottom:0.6em;">
+            <button is="emby-button" type="button" id="DeleteMarkedButton" class="raised" disabled><span>Delete marked (0)</span></button>
+          </div>
           <div id="DuplicateGroups"></div>
         </form>
       </div>
@@ -59,6 +62,11 @@
       // plugin's "Libraries to analyze" (v0.2.6.0) — ApiClient.getItems, one level at a time,
       // lazily expanded. See that plugin's configPage.html for the original write-up of why.
       const scopesEl = document.querySelector('#ScanScopes');
+      // Guards "Save scope": if the library list failed to load, the checkbox tree below is
+      // empty, and saving in that state would silently overwrite the real saved scope with
+      // "nothing ticked" — which this plugin treats as "scan everything". See the submit
+      // handler, which refuses to save while this is true.
+      let scopesLoadFailed = false;
       const renderScopeChoices = async (selectedIds) => {
         const selected = new Set((selectedIds || []).map(String));
         scopesEl.textContent = 'Loading libraries…';
@@ -66,9 +74,11 @@
         try {
           folders = await ApiClient.getVirtualFolders();
         } catch (error) {
-          scopesEl.textContent = 'Could not load libraries — save still works with the previous selection.';
+          scopesEl.textContent = 'Could not load libraries — reload this page before saving, or the scope below (currently empty) would overwrite your real saved selection.';
+          scopesLoadFailed = true;
           return;
         }
+        scopesLoadFailed = false;
         scopesEl.textContent = '';
         const known = new Set();
         // Tracks every rendered row by id, so a subfolder resolved as a flat top-level
@@ -204,6 +214,10 @@
 
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
+        if (scopesLoadFailed) {
+          window.alert('The library list failed to load, so the scope shown here is empty. Saving now would widen scanning to the whole server instead of your real selection. Reload the page and try again.');
+          return;
+        }
         Dashboard.showLoadingMsg();
         const config = await ApiClient.getPluginConfiguration(pluginId);
         set(config, 'ScanScopeIds', Array.from(document.querySelectorAll('.dupScopeCheck'))
@@ -231,14 +245,28 @@
       };
 
       const groupsEl = document.querySelector('#DuplicateGroups');
+      const deleteMarkedButton = document.querySelector('#DeleteMarkedButton');
       // Flat list of every rendered file-row checkbox, in document order, for keyboard nav.
       let rowCheckboxes = [];
+      // Which group (by index into this array) each checkbox belongs to, and every distinct
+      // library item id in that group — used to refuse marking every copy in a group before
+      // the confirm dialog even appears (the server refuses it too; this is just so the admin
+      // finds out before typing "OK", not after).
+      let groupItemIdSets = [];
+
+      const updateDeleteButton = () => {
+        const count = rowCheckboxes.filter(cb => cb.checked).length;
+        deleteMarkedButton.querySelector('span').textContent = 'Delete marked (' + count + ')';
+        deleteMarkedButton.disabled = count === 0;
+      };
 
       const renderGroups = (groups) => {
         groupsEl.textContent = '';
         rowCheckboxes = [];
+        groupItemIdSets = [];
         if (!groups || !groups.length) {
           groupsEl.textContent = 'No duplicates found yet — run a scan above.';
+          updateDeleteButton();
           return;
         }
         groups.forEach((group) => {
@@ -254,6 +282,23 @@
           heading.style.marginBottom = '0.4em';
           heading.textContent = group.files.length + ' identical files (sha256 ' + group.sha256.slice(0, 12) + '…)';
           box.appendChild(heading);
+
+          // A library item can legitimately have more than one media source, so two rows in
+          // the same group can share an itemId — deleting either one deletes the WHOLE item,
+          // meaning both. Flag it rather than let that surprise the admin after the fact.
+          const itemIdCounts = new Map();
+          group.files.forEach((file) => itemIdCounts.set(file.itemId, (itemIdCounts.get(file.itemId) || 0) + 1));
+          if ([...itemIdCounts.values()].some(count => count > 1)) {
+            const warning = document.createElement('div');
+            warning.style.color = '#e5a00d';
+            warning.style.fontSize = '0.8em';
+            warning.style.marginBottom = '0.4em';
+            warning.textContent = '⚠ Some rows below belong to the SAME library item (multiple sources on one title) — deleting one deletes all of that item’s sources together, not just the row you marked.';
+            box.appendChild(warning);
+          }
+
+          const groupIndex = groupItemIdSets.length;
+          groupItemIdSets.push(new Set(group.files.map(file => file.itemId)));
 
           // Recommend keeping the largest file (same encode ⇒ identical hash means all files
           // in a Tier-1 group ARE the same bytes, so size ties are common; this still gives a
@@ -271,6 +316,9 @@
             const cb = document.createElement('input');
             cb.type = 'checkbox';
             cb.dataset.itemId = file.itemId;
+            cb.dataset.path = file.path;
+            cb.dataset.groupIndex = String(groupIndex);
+            cb.addEventListener('change', updateDeleteButton);
             rowCheckboxes.push(cb);
             row.appendChild(cb);
 
@@ -288,6 +336,7 @@
           });
           groupsEl.appendChild(box);
         });
+        updateDeleteButton();
       };
 
       const loadGroups = async () => {
@@ -322,7 +371,13 @@
         try {
           const status = await ApiClient.ajax({ type: 'GET', url: statusUrl, dataType: 'json' });
           renderScanState(status);
-          if (!status.running && pollTimer !== null) {
+          if (status.running) {
+            // Starts its OWN interval rather than relying only on the Scan button's click
+            // handler to do so — otherwise a page reload (or a second admin/tab) while a scan
+            // was already running left this page's progress frozen on whatever the single
+            // initial poll below showed, forever, since nothing here ever scheduled another.
+            if (pollTimer === null) { pollTimer = setInterval(pollStatus, 1000); }
+          } else if (pollTimer !== null) {
             clearInterval(pollTimer);
             pollTimer = null;
             await loadGroups();
@@ -342,8 +397,7 @@
           stateEl.textContent = 'Could not start scan: ' + (error && error.message ? error.message : 'unknown error');
           return;
         }
-        if (pollTimer === null) { pollTimer = setInterval(pollStatus, 1000); }
-        pollStatus();
+        await pollStatus();
       });
 
       pollStatus();
@@ -359,6 +413,7 @@
         }
         if (event.key === 'Escape') {
           rowCheckboxes.forEach(cb => { cb.checked = false; });
+          updateDeleteButton();
           return;
         }
         if (event.key === 'Enter') {
@@ -378,22 +433,48 @@
       const confirmDelete = async () => {
         const marked = rowCheckboxes.filter(cb => cb.checked);
         if (!marked.length) { return; }
+
+        // Client-side pre-check, purely for a faster/friendlier "no" — the server refuses
+        // this too and is the check that actually matters, since nothing here can be trusted
+        // to have stayed in sync with the real stored groups (e.g. another admin acting at
+        // the same time).
+        const markedIds = new Set(marked.map(cb => cb.dataset.itemId));
+        const wouldEmptyAGroup = groupItemIdSets.some(
+          ids => ids.size > 0 && [...ids].every(id => markedIds.has(id)));
+        if (wouldEmptyAGroup) {
+          window.alert('That would mark every copy in at least one group — at least one file has to stay. Unmark one file in each such group and try again.');
+          return;
+        }
+
+        const paths = marked.map(cb => cb.dataset.path);
         const ok = window.confirm(
-          'Permanently delete ' + marked.length + ' file(s)? This cannot be undone.');
+          'Permanently delete ' + marked.length + ' file(s)? For a title stored in its own folder, this also removes that WHOLE folder (posters, subtitles, extras, NFO — everything in it), not just the video file. This cannot be undone.\n\n'
+          + paths.join('\n'));
         if (!ok) { return; }
+
         Dashboard.showLoadingMsg();
         try {
-          await ApiClient.ajax({
+          const response = await ApiClient.ajax({
             type: 'POST',
             url: deleteUrl,
             data: JSON.stringify({ itemIds: marked.map(cb => cb.dataset.itemId) }),
             contentType: 'application/json',
+            dataType: 'json',
           });
-          await loadGroups();
+          const failed = (response.results || []).filter(r => !r.deleted);
+          if (failed.length) {
+            window.alert(failed.length + ' of ' + marked.length + ' file(s) could NOT be deleted:\n'
+              + failed.map(r => r.itemId + ' — ' + r.reason).join('\n'));
+          }
+        } catch (error) {
+          window.alert('Delete request failed: ' + (error && error.message ? error.message : 'unknown error') + '. Nothing may have been deleted — reload and check before retrying.');
         } finally {
           Dashboard.hideLoadingMsg();
+          await loadGroups();
         }
       };
+
+      deleteMarkedButton.addEventListener('click', () => { void confirmDelete(); });
     })();
   </script>
   </div>

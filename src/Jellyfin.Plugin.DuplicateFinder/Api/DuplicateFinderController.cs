@@ -26,9 +26,15 @@ public sealed class DuplicateFinderController(
     [HttpPost("scan")]
     public ActionResult StartScan()
     {
-        // Fire-and-forget by design: a full-library hash pass can take minutes, and the config
-        // page polls /scan/status for progress rather than holding one long HTTP request open.
-        _ = scanner.ScanAsync(CancellationToken.None);
+        // Task.Run, not a bare fire-and-forget call: ScanAsync's semaphore acquisition and its
+        // initial library enumeration run SYNCHRONOUSLY on an uncontended gate (a completed
+        // Task doesn't yield back to the caller until a genuinely asynchronous operation is
+        // hit) — a bare `_ = scanner.ScanAsync(...)` therefore blocked THIS request thread
+        // through the whole item enumeration on a large library, despite the intent below.
+        // Task.Run moves that work onto a thread-pool thread so the response really is
+        // immediate; the config page then polls /scan/status for progress rather than holding
+        // one long HTTP request open.
+        _ = Task.Run(() => scanner.ScanAsync(CancellationToken.None));
         return Accepted();
     }
 
@@ -83,54 +89,106 @@ public sealed class DuplicateFinderController(
     /// Permanently deletes the given items (identified by <see cref="DeleteRequest.ItemIds"/>)
     /// and removes them from the stored groups. Never called automatically — the config page
     /// only sends this after the admin has explicitly ticked items and confirmed.
+    ///
+    /// Two safety checks that do NOT trust the client: (1) an id whose deletion would leave a
+    /// stored group with zero remaining files is refused server-side — the client also guards
+    /// against this before showing the confirmation dialog, but that guard is only a UX nicety,
+    /// this is the real one; (2) a single item's failure never aborts the batch or skips
+    /// pruning for items that DID succeed (a narrow exception filter here previously let an
+    /// unexpected exception type escape and abandon bookkeeping for already-deleted items).
     /// </summary>
     [HttpPost("delete")]
     public async Task<ActionResult> Delete([FromBody] DeleteRequest request, CancellationToken cancellationToken)
     {
-        var results = new List<DeleteResult>();
-        foreach (var idText in request.ItemIds)
+        var groups = await store.LoadAsync(cancellationToken).ConfigureAwait(false);
+
+        var requested = request.ItemIds
+            .Select(text => (Text: text, Id: Guid.TryParse(text, out var parsed) ? parsed : (Guid?)null))
+            .ToList();
+        var requestedIds = new HashSet<Guid>(requested.Where(r => r.Id.HasValue).Select(r => r.Id!.Value));
+
+        // A group whose EVERY distinct item was requested would end up with nothing left —
+        // block those ids rather than guess which one the admin meant to keep. Distinct by
+        // item, not by file row: one item can legitimately have more than one media source, so
+        // "every file in the group" and "every item in the group" are not the same count.
+        var blockedIds = new HashSet<Guid>();
+        foreach (var group in groups)
         {
-            if (!Guid.TryParse(idText, out var id))
+            var groupItemIds = group.Files.Select(file => file.ItemId).Distinct().ToList();
+            if (groupItemIds.Count > 0 && groupItemIds.All(requestedIds.Contains))
             {
-                results.Add(new DeleteResult(idText, false, "invalid-id"));
+                foreach (var id in groupItemIds)
+                {
+                    blockedIds.Add(id);
+                }
+            }
+        }
+
+        var results = new List<DeleteResult>();
+        var deletedIds = new HashSet<Guid>();
+        foreach (var (text, id) in requested)
+        {
+            if (id is null)
+            {
+                results.Add(new DeleteResult(text, false, "invalid-id"));
                 continue;
             }
 
-            var item = libraryManager.GetItemById(id);
+            if (blockedIds.Contains(id.Value))
+            {
+                results.Add(new DeleteResult(text, false, "would-empty-group"));
+                continue;
+            }
+
+            var item = libraryManager.GetItemById(id.Value);
             if (item is null)
             {
-                results.Add(new DeleteResult(idText, false, "not-found"));
+                results.Add(new DeleteResult(text, false, "not-found"));
                 continue;
             }
 
             try
             {
                 libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = true }, notifyParentItem: true);
-                results.Add(new DeleteResult(idText, true, null));
+                results.Add(new DeleteResult(text, true, null));
+                deletedIds.Add(id.Value);
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            catch (Exception exception)
             {
+                // Deliberately broad, not just IOException/UnauthorizedAccessException:
+                // DeleteItem can throw other types depending on the underlying provider, and
+                // one unreadable/locked file must never abort the whole batch or skip pruning
+                // for items that already succeeded (see loop bookkeeping below).
                 logger.LogError(exception, "Failed to delete duplicate item {ItemId}", id);
-                results.Add(new DeleteResult(idText, false, "delete-failed"));
+                results.Add(new DeleteResult(text, false, "delete-failed"));
             }
         }
 
-        // Drop deleted ids from the stored groups so a page refresh doesn't show them again —
-        // the deletion already happened, re-showing them would invite deleting a missing file twice.
-        var deletedIds = new HashSet<string>(
-            results.Where(r => r.Deleted).Select(r => r.ItemId),
-            StringComparer.OrdinalIgnoreCase);
-        var groups = await store.LoadAsync(cancellationToken).ConfigureAwait(false);
-        var updated = groups
-            .Select(group => group with
-            {
-                Files = group.Files.Where(file => !deletedIds.Contains(file.ItemId.ToString())).ToList()
-            })
-            .Where(group => group.Files.Count > 1)
-            .ToList();
-        await store.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        // Drop successfully-deleted ids from the stored groups so a page refresh doesn't show
+        // them again. Compares the PARSED Guid, not the client's raw request string — Jellyfin
+        // and DuplicateCandidate both serialize a Guid in "D" format by default so this rarely
+        // mattered in practice via this plugin's own page, but a request carrying any other
+        // valid Guid.TryParse-accepted format (e.g. "N", no dashes) previously never pruned.
+        if (deletedIds.Count > 0)
+        {
+            var updated = groups
+                .Select(group => group with
+                {
+                    Files = group.Files.Where(file => !deletedIds.Contains(file.ItemId)).ToList()
+                })
+                .Where(group => group.Files.Count > 1)
+                .ToList();
+            await store.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        }
 
-        return Ok(new { results });
+        // Same lowercase-JSON reasoning as GetScanStatus/ToJson above: DeleteResult's own
+        // PascalCase properties would otherwise reach the config page as "ItemId"/"Deleted"/
+        // "Reason", which its lowercase JS reads (r.itemId/r.deleted/r.reason) would silently
+        // never match — the per-file failure list would look empty even on a real failure.
+        return Ok(new
+        {
+            results = results.Select(r => new { itemId = r.ItemId, deleted = r.Deleted, reason = r.Reason })
+        });
     }
 
     /// <summary>Request body for <see cref="Delete"/>.</summary>

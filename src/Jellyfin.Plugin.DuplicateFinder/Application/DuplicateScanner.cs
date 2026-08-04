@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.DuplicateFinder.Configuration;
@@ -46,6 +47,11 @@ public sealed class DuplicateScanner(
     // running would otherwise hash the same files twice for nothing.
     private readonly SemaphoreSlim _gate = new(1, 1);
 
+    // Cancels any in-flight scan on Dispose (host/plugin shutdown) — ScanAsync is started
+    // fire-and-forget from the controller, so without this a shutdown mid-scan would otherwise
+    // leave a background task still reading files and, eventually, hitting the disposed gate.
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+
     /// <summary>Current/last scan status, polled by the config page.</summary>
     public ScanStatus Status { get; } = new();
 
@@ -75,7 +81,10 @@ public sealed class DuplicateScanner(
     /// </summary>
     public async Task ScanAsync(CancellationToken cancellationToken)
     {
-        if (!await _gate.WaitAsync(0, cancellationToken).ConfigureAwait(false))
+        using var linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeCancellation.Token);
+        var scanToken = linkedCancellation.Token;
+
+        if (!await _gate.WaitAsync(0, scanToken).ConfigureAwait(false))
         {
             // Already running — the caller's "Scan now" click is redundant, not an error.
             return;
@@ -86,14 +95,38 @@ public sealed class DuplicateScanner(
             var items = SelectItems();
             var candidates = items.SelectMany(BuildCandidates)
                 .Select(pair => ToCandidate(pair.Item, pair.Path))
+                .Where(candidate => candidate is not null)
+                .Select(candidate => candidate!)
+                // Two items can report the SAME physical file (linked alternate versions, or
+                // the same library root reachable through two libraries/bind mounts) — without
+                // this, that one file hashes identically to itself and is reported as its own
+                // duplicate.
+                .DistinctBy(candidate => Path.GetFullPath(candidate.Path))
                 .ToList();
             Status.Running = true;
             Status.Checked = 0;
             Status.Total = candidates.Count;
             Status.LastError = null;
 
-            var cache = await hashCache.LoadAsync(cancellationToken).ConfigureAwait(false);
+            var cache = await hashCache.LoadAsync(scanToken).ConfigureAwait(false);
             var cacheChanged = false;
+            var checkpointStopwatch = Stopwatch.StartNew();
+
+            // Checkpoints the cache to disk roughly every 30s of hashing (only when something
+            // actually changed) rather than solely at the very end — on a large library the
+            // full scan can take long enough that a crash/host-shutdown partway through would
+            // otherwise discard every hash computed so far, forcing a full re-hash next time.
+            async Task CheckpointIfDueAsync()
+            {
+                if (!cacheChanged || checkpointStopwatch.Elapsed < TimeSpan.FromSeconds(30))
+                {
+                    return;
+                }
+
+                await hashCache.SaveAsync(cache, scanToken).ConfigureAwait(false);
+                cacheChanged = false;
+                checkpointStopwatch.Restart();
+            }
 
             // Phase 1 (free): a file with a size shared by no other candidate cannot possibly
             // be a byte-for-byte duplicate of anything — resolved without touching the file.
@@ -114,8 +147,8 @@ public sealed class DuplicateScanner(
             var quickGroups = new Dictionary<(long Size, string QuickHash), List<DuplicateCandidate>>();
             foreach (var candidate in sizeSharedCandidates)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var quickHash = await GetOrComputeQuickHashAsync(candidate, cache, changed => cacheChanged |= changed, cancellationToken)
+                scanToken.ThrowIfCancellationRequested();
+                var quickHash = await GetOrComputeQuickHashAsync(candidate, cache, changed => cacheChanged |= changed, scanToken)
                     .ConfigureAwait(false);
                 if (quickHash is null)
                 {
@@ -132,6 +165,7 @@ public sealed class DuplicateScanner(
                 }
 
                 list.Add(candidate);
+                await CheckpointIfDueAsync().ConfigureAwait(false);
             }
 
             // Phase 3 (expensive, only for real candidates): the full file hash.
@@ -146,8 +180,8 @@ public sealed class DuplicateScanner(
 
                 foreach (var candidate in group)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var fullHash = await GetOrComputeFullHashAsync(candidate, cache, changed => cacheChanged |= changed, cancellationToken)
+                    scanToken.ThrowIfCancellationRequested();
+                    var fullHash = await GetOrComputeFullHashAsync(candidate, cache, changed => cacheChanged |= changed, scanToken)
                         .ConfigureAwait(false);
                     Status.Checked++;
                     if (fullHash is null)
@@ -163,17 +197,34 @@ public sealed class DuplicateScanner(
                     }
 
                     list.Add(candidate);
+                    await CheckpointIfDueAsync().ConfigureAwait(false);
                 }
             }
 
             var groups = GroupByHash(byFullHash);
 
-            if (cacheChanged)
+            // Drop entries for paths no longer among this scan's candidates (deleted, moved, or
+            // no longer in the configured scope) — otherwise the cache grows forever and a stale
+            // entry could theoretically be matched again if a future file ever reused the exact
+            // same path, size, and last-write time.
+            var currentPaths = new HashSet<string>(candidates.Select(candidate => candidate.Path), StringComparer.Ordinal);
+            var prunedCount = cache.Keys.Count(path => !currentPaths.Contains(path));
+            if (prunedCount > 0)
             {
-                await hashCache.SaveAsync(cache, cancellationToken).ConfigureAwait(false);
+                foreach (var staleKey in cache.Keys.Where(path => !currentPaths.Contains(path)).ToList())
+                {
+                    cache.Remove(staleKey);
+                }
+
+                cacheChanged = true;
             }
 
-            await store.SaveAsync(groups, cancellationToken).ConfigureAwait(false);
+            if (cacheChanged)
+            {
+                await hashCache.SaveAsync(cache, scanToken).ConfigureAwait(false);
+            }
+
+            await store.SaveAsync(groups, scanToken).ConfigureAwait(false);
             Status.LastFinishedAt = DateTimeOffset.UtcNow;
             Status.LastGroupCount = groups.Count;
         }
@@ -189,7 +240,16 @@ public sealed class DuplicateScanner(
         finally
         {
             Status.Running = false;
-            _gate.Release();
+            try
+            {
+                _gate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Dispose() (host/plugin shutdown) raced ahead of this background task's own
+                // cleanup — nothing left to release into at that point, and nothing further
+                // in this method runs after the finally block anyway.
+            }
         }
     }
 
@@ -216,7 +276,13 @@ public sealed class DuplicateScanner(
             .Where(source => !source.IsRemote && !string.IsNullOrWhiteSpace(source.Path) && File.Exists(source.Path))
             .Select(source => (item, source.Path));
 
-    private static DuplicateCandidate ToCandidate(BaseItem item, string path)
+    /// <summary>
+    /// Builds a candidate, or null if the file's size can't be read (permission error, it
+    /// vanished between enumeration and here, ...). A stat failure used to fall back to
+    /// SizeBytes=0, which silently pooled every such broken file into one bogus "same size"
+    /// group together — now they're excluded from the scan entirely instead.
+    /// </summary>
+    private static DuplicateCandidate? ToCandidate(BaseItem item, string path)
     {
         var videoStream = item.GetMediaStreams()
             .FirstOrDefault(stream => stream.Type == MediaBrowser.Model.Entities.MediaStreamType.Video);
@@ -225,9 +291,9 @@ public sealed class DuplicateScanner(
         {
             sizeBytes = new FileInfo(path).Length;
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            sizeBytes = 0;
+            return null;
         }
 
         return new DuplicateCandidate(
@@ -252,18 +318,39 @@ public sealed class DuplicateScanner(
             ? entry
             : new CachedFileHash(path, sizeBytes, lastWriteTimeUtcTicks, QuickHash: null, FullHash: null);
 
+    /// <summary>
+    /// <see cref="File.GetLastWriteTimeUtc(string)"/> does NOT throw for a missing file — it returns a
+    /// sentinel (1601-01-01) — so an explicit existence check is required, or a file that
+    /// vanished between candidate-building and hashing would silently get treated as "changed"
+    /// (sentinel mtime ≠ cached mtime) rather than skipped outright.
+    /// </summary>
+    private static bool TryGetLastWriteTimeUtcTicks(string path, out long ticks)
+    {
+        if (!File.Exists(path))
+        {
+            ticks = 0;
+            return false;
+        }
+
+        try
+        {
+            ticks = File.GetLastWriteTimeUtc(path).Ticks;
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            ticks = 0;
+            return false;
+        }
+    }
+
     internal static async Task<string?> GetOrComputeQuickHashAsync(
         DuplicateCandidate candidate,
         Dictionary<string, CachedFileHash> cache,
         Action<bool> reportChanged,
         CancellationToken cancellationToken)
     {
-        long mtimeTicks;
-        try
-        {
-            mtimeTicks = File.GetLastWriteTimeUtc(candidate.Path).Ticks;
-        }
-        catch (IOException)
+        if (!TryGetLastWriteTimeUtcTicks(candidate.Path, out var mtimeTicks))
         {
             return null;
         }
@@ -280,13 +367,12 @@ public sealed class DuplicateScanner(
         {
             hash = await QuickHashFileAsync(candidate.Path, cancellationToken).ConfigureAwait(false);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return null;
         }
 
-        cache[candidate.Path] = entry with { QuickHash = hash };
-        reportChanged(true);
+        CacheIfStillUnchanged(candidate, mtimeTicks, cache, entry with { QuickHash = hash }, reportChanged);
         return hash;
     }
 
@@ -296,12 +382,7 @@ public sealed class DuplicateScanner(
         Action<bool> reportChanged,
         CancellationToken cancellationToken)
     {
-        long mtimeTicks;
-        try
-        {
-            mtimeTicks = File.GetLastWriteTimeUtc(candidate.Path).Ticks;
-        }
-        catch (IOException)
+        if (!TryGetLastWriteTimeUtcTicks(candidate.Path, out var mtimeTicks))
         {
             return null;
         }
@@ -318,14 +399,45 @@ public sealed class DuplicateScanner(
         {
             hash = await HashFileAsync(candidate.Path, cancellationToken).ConfigureAwait(false);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return null;
         }
 
-        cache[candidate.Path] = entry with { FullHash = hash };
-        reportChanged(true);
+        CacheIfStillUnchanged(candidate, mtimeTicks, cache, entry with { FullHash = hash }, reportChanged);
         return hash;
+    }
+
+    /// <summary>
+    /// Only writes the freshly-computed hash into the cache if the file's size/mtime are still
+    /// what they were right before we started reading it — narrows (does not eliminate; nothing
+    /// can, short of a filesystem-level lock) the window where a file modified DURING hashing
+    /// would otherwise cache a hash that matches neither its old nor its new content. The
+    /// hash just computed is still returned to the caller either way — it's valid for THIS
+    /// scan's own grouping regardless, it just must not be trusted on a LATER scan.
+    /// </summary>
+    private static void CacheIfStillUnchanged(
+        DuplicateCandidate candidate, long mtimeBeforeHashing, Dictionary<string, CachedFileHash> cache, CachedFileHash updated, Action<bool> reportChanged)
+    {
+        long currentSize;
+        try
+        {
+            currentSize = new FileInfo(candidate.Path).Length;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        if (!TryGetLastWriteTimeUtcTicks(candidate.Path, out var mtimeAfterHashing)
+            || mtimeAfterHashing != mtimeBeforeHashing
+            || currentSize != candidate.SizeBytes)
+        {
+            return;
+        }
+
+        cache[candidate.Path] = updated;
+        reportChanged(true);
     }
 
     private static async Task<string> QuickHashFileAsync(string path, CancellationToken cancellationToken)
@@ -367,5 +479,13 @@ public sealed class DuplicateScanner(
         Plugin.Instance?.Configuration ?? new PluginConfiguration();
 
     /// <inheritdoc />
-    public void Dispose() => _gate.Dispose();
+    public void Dispose()
+    {
+        // Cancel FIRST: an in-flight ScanAsync observes this at its next
+        // ThrowIfCancellationRequested/await and unwinds through its own finally block (which
+        // defensively tolerates the gate already being disposed by the time it gets there).
+        _lifetimeCancellation.Cancel();
+        _lifetimeCancellation.Dispose();
+        _gate.Dispose();
+    }
 }
