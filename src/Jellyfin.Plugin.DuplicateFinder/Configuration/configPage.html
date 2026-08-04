@@ -71,8 +71,27 @@
         }
         scopesEl.textContent = '';
         const known = new Set();
-        const addRow = (parentEl, id, name, checked, depth) => {
-          known.add(String(id));
+        // Tracks every rendered row by id, so a subfolder resolved as a flat top-level
+        // fallback (below) can be REPLACED once its real, correctly-nested position is
+        // discovered by expanding its actual parent — without this, the same folder ends
+        // up shown twice: once flat at the top, once in its real spot in the tree.
+        const rowsById = new Map();
+        const addRow = (parentEl, id, name, checked, depth, isFallback) => {
+          const key = String(id);
+          const existing = rowsById.get(key);
+          if (existing) {
+            if (isFallback) {
+              // Already shown (either an earlier fallback, or its real nested position
+              // already rendered) — do not add a second copy.
+              return;
+            }
+            // A properly-positioned row is arriving after a flat fallback for the same
+            // id — drop the fallback, the real one below replaces it.
+            existing.row.remove();
+            existing.childrenEl.remove();
+            rowsById.delete(key);
+          }
+          known.add(key);
           const row = document.createElement('div');
           row.style.margin = '0.25em 0';
           row.style.marginLeft = (depth * 1.5) + 'em';
@@ -101,10 +120,18 @@
           span.textContent = name;
           label.appendChild(span);
           row.appendChild(label);
+          if (isFallback) {
+            const hint = document.createElement('span');
+            hint.textContent = ' (elsewhere in the tree — expand its library to see it in place)';
+            hint.style.opacity = '0.6';
+            hint.style.fontSize = '0.8em';
+            row.appendChild(hint);
+          }
           parentEl.appendChild(row);
 
           const childrenEl = document.createElement('div');
           parentEl.appendChild(childrenEl);
+          rowsById.set(key, { row, childrenEl });
           let loaded = false;
           toggle.addEventListener('click', async () => {
             if (loaded) {
@@ -136,10 +163,10 @@
               childrenEl.style.opacity = '0.7';
               return;
             }
-            children.forEach(child => addRow(childrenEl, child.Id, child.Name, selected.has(String(child.Id)), depth + 1));
+            children.forEach(child => addRow(childrenEl, child.Id, child.Name, selected.has(String(child.Id)), depth + 1, false));
           });
         };
-        (folders || []).forEach(folder => addRow(scopesEl, folder.ItemId, folder.Name, selected.has(String(folder.ItemId)), 0));
+        (folders || []).forEach(folder => addRow(scopesEl, folder.ItemId, folder.Name, selected.has(String(folder.ItemId)), 0, false));
         // A saved id not among the TOP-LEVEL libraries isn't necessarily removed — it's very
         // likely a subfolder picked via ▸, which is only known once its parent has been
         // expanded (lazy). Look those ids up directly instead of assuming they're gone; only
@@ -153,10 +180,10 @@
           } catch (error) {
             found = [];
           }
-          found.forEach(item => addRow(scopesEl, item.Id, item.Name, true, 0));
+          found.forEach(item => addRow(scopesEl, item.Id, item.Name, true, 0, true));
           const foundIds = new Set(found.map(item => String(item.Id)));
           unresolvedIds.filter(id => !foundIds.has(id))
-            .forEach(id => addRow(scopesEl, id, '(removed library ' + id + ')', true, 0));
+            .forEach(id => addRow(scopesEl, id, '(removed library ' + id + ')', true, 0, true));
         }
         if (!scopesEl.children.length) { scopesEl.textContent = 'No libraries found on this server.'; }
       };
