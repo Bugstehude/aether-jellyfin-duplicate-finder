@@ -7,7 +7,7 @@
     <!-- MUSS zu build.yaml passen (siehe aether-jellyfin-analysis-plugin für die
          Lehre, warum: die Assembly-Version stand dort einmal drei Veröffentlichungen
          lang falsch). -->
-    <VersionPrefix>0.1.0.0</VersionPrefix>
+    <VersionPrefix>0.1.1.0</VersionPrefix>
     <LangVersion>13</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

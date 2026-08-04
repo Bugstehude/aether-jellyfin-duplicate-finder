@@ -34,15 +34,50 @@ public sealed class DuplicateFinderController(
 
     /// <summary>Gets the current/last scan's progress.</summary>
     [HttpGet("scan/status")]
-    public ActionResult GetScanStatus() => Ok(scanner.Status);
+    public ActionResult GetScanStatus()
+    {
+        var status = scanner.Status;
+        // Explicit lowercase-keyed anonymous object rather than serializing the ScanStatus
+        // POCO directly: Jellyfin's server does NOT apply a camelCase naming policy, so a
+        // plain `Ok(status)` would emit PascalCase keys ("Running", "LastFinishedAt", ...)
+        // that silently don't match the config page's lowercase JS field reads — the exact
+        // bug this fixes (status always read as undefined, page looked like nothing happened
+        // even though the scan ran and completed correctly). Same convention the AETHER
+        // Analysis plugin's activity endpoint already uses, for the same reason.
+        return Ok(new
+        {
+            running = status.Running,
+            checkedCount = status.Checked,
+            total = status.Total,
+            lastFinishedAt = status.LastFinishedAt,
+            lastGroupCount = status.LastGroupCount,
+            lastError = status.LastError
+        });
+    }
 
     /// <summary>Gets the duplicate groups found by the last completed scan.</summary>
     [HttpGet("groups")]
     public async Task<ActionResult> GetGroups(CancellationToken cancellationToken)
     {
         var groups = await store.LoadAsync(cancellationToken).ConfigureAwait(false);
-        return Ok(groups);
+        return Ok(groups.Select(ToJson));
     }
+
+    private static object ToJson(DuplicateGroup group) => new
+    {
+        sha256 = group.Sha256,
+        files = group.Files.Select(file => new
+        {
+            itemId = file.ItemId,
+            itemName = file.ItemName,
+            path = file.Path,
+            sizeBytes = file.SizeBytes,
+            width = file.Width,
+            height = file.Height,
+            durationSeconds = file.DurationSeconds,
+            codec = file.Codec
+        })
+    };
 
     /// <summary>
     /// Permanently deletes the given items (identified by <see cref="DeleteRequest.ItemIds"/>)

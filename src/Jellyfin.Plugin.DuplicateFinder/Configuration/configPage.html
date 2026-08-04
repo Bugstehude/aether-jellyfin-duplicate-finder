@@ -140,9 +140,24 @@
           });
         };
         (folders || []).forEach(folder => addRow(scopesEl, folder.ItemId, folder.Name, selected.has(String(folder.ItemId)), 0));
-        (selectedIds || []).map(String).forEach(id => {
-          if (!known.has(id)) { addRow(scopesEl, id, '(removed library ' + id + ')', true, 0); }
-        });
+        // A saved id not among the TOP-LEVEL libraries isn't necessarily removed — it's very
+        // likely a subfolder picked via ▸, which is only known once its parent has been
+        // expanded (lazy). Look those ids up directly instead of assuming they're gone; only
+        // fall back to "(removed library …)" for ids the server genuinely no longer has.
+        const unresolvedIds = (selectedIds || []).map(String).filter(id => !known.has(id));
+        if (unresolvedIds.length) {
+          let found = [];
+          try {
+            const result = await ApiClient.getItems(ApiClient.getCurrentUserId(), { Ids: unresolvedIds.join(',') });
+            found = result.Items || [];
+          } catch (error) {
+            found = [];
+          }
+          found.forEach(item => addRow(scopesEl, item.Id, item.Name, true, 0));
+          const foundIds = new Set(found.map(item => String(item.Id)));
+          unresolvedIds.filter(id => !foundIds.has(id))
+            .forEach(id => addRow(scopesEl, id, '(removed library ' + id + ')', true, 0));
+        }
         if (!scopesEl.children.length) { scopesEl.textContent = 'No libraries found on this server.'; }
       };
 
@@ -210,15 +225,15 @@
           heading.style.opacity = '0.75';
           heading.style.fontSize = '0.8em';
           heading.style.marginBottom = '0.4em';
-          heading.textContent = group.Files.length + ' identical files (sha256 ' + group.Sha256.slice(0, 12) + '…)';
+          heading.textContent = group.files.length + ' identical files (sha256 ' + group.sha256.slice(0, 12) + '…)';
           box.appendChild(heading);
 
           // Recommend keeping the largest file (same encode ⇒ identical hash means all files
           // in a Tier-1 group ARE the same bytes, so size ties are common; this still gives a
           // stable, deterministic pick rather than an arbitrary first-in-list one).
-          const biggest = group.Files.reduce((a, b) => (b.SizeBytes > a.SizeBytes ? b : a), group.Files[0]);
+          const biggest = group.files.reduce((a, b) => (b.sizeBytes > a.sizeBytes ? b : a), group.files[0]);
 
-          group.Files.forEach((file) => {
+          group.files.forEach((file) => {
             const row = document.createElement('label');
             row.style.display = 'flex';
             row.style.alignItems = 'center';
@@ -228,16 +243,16 @@
 
             const cb = document.createElement('input');
             cb.type = 'checkbox';
-            cb.dataset.itemId = file.ItemId;
+            cb.dataset.itemId = file.itemId;
             rowCheckboxes.push(cb);
             row.appendChild(cb);
 
             const info = document.createElement('span');
             const suggestion = file === biggest ? ' — suggested keep' : '';
-            info.textContent = file.ItemName + '  ·  ' + file.Path + '  ·  '
-              + bytes(file.SizeBytes) + '  ·  '
-              + (file.Width && file.Height ? file.Width + '×' + file.Height + '  ·  ' : '')
-              + duration(file.DurationSeconds) + (file.Codec ? '  ·  ' + file.Codec : '')
+            info.textContent = file.itemName + '  ·  ' + file.path + '  ·  '
+              + bytes(file.sizeBytes) + '  ·  '
+              + (file.width && file.height ? file.width + '×' + file.height + '  ·  ' : '')
+              + duration(file.durationSeconds) + (file.codec ? '  ·  ' + file.codec : '')
               + suggestion;
             info.style.fontSize = '0.85em';
             row.appendChild(info);
@@ -262,9 +277,9 @@
         const barWrap = document.querySelector('#ScanBarWrap');
         const bar = document.querySelector('#ScanBar');
         if (status.running) {
-          stateEl.textContent = 'Scanning… ' + status.checked + '/' + status.total;
+          stateEl.textContent = 'Scanning… ' + status.checkedCount + '/' + status.total;
           barWrap.style.display = status.total > 0 ? 'block' : 'none';
-          bar.style.width = status.total > 0 ? Math.round((status.checked / status.total) * 100) + '%' : '0%';
+          bar.style.width = status.total > 0 ? Math.round((status.checkedCount / status.total) * 100) + '%' : '0%';
         } else {
           barWrap.style.display = 'none';
           stateEl.textContent = status.lastError
@@ -291,7 +306,15 @@
       };
 
       document.querySelector('#ScanButton').addEventListener('click', async () => {
-        await ApiClient.ajax({ type: 'POST', url: scanUrl });
+        const stateEl = document.querySelector('#ScanState');
+        try {
+          await ApiClient.ajax({ type: 'POST', url: scanUrl });
+        } catch (error) {
+          // Surface a failed start ON THE PAGE — silently doing nothing here looked
+          // indistinguishable from "scan ran, found zero duplicates" to a tester.
+          stateEl.textContent = 'Could not start scan: ' + (error && error.message ? error.message : 'unknown error');
+          return;
+        }
         if (pollTimer === null) { pollTimer = setInterval(pollStatus, 1000); }
         pollStatus();
       });
