@@ -20,6 +20,20 @@ per-item, confirmed action.
   [AETHER Analysis plugin](https://github.com/Bugstehude/aether-jellyfin-analysis-plugin)
   already uses.
 
+Tier 1 itself is a three-phase pipeline so the expensive full-file hash only ever runs where it
+actually might matter, and never twice on an unmodified file across scans:
+
+1. **Group by file size** (free — no I/O). Two files can only be identical if they're the same
+   size, so a file with a unique size needs no further work at all.
+2. **Quick hash** — only the first 64 KiB — for files that already share a size. Identical
+   files are identical everywhere, including their first bytes, so this can only eliminate
+   genuinely different files, never miss a real duplicate.
+3. **Full SHA-256** over the whole file, only for the (size, quick hash) group that's left —
+   normally a tiny fraction of the library.
+
+Both hash phases are cached per file (path + size + last-write time) between scans, so a file
+that hasn't changed since its last scan is never re-read at all.
+
 ## Scope
 
 The config page lets you tick specific libraries, or click ▸ next to a library to drill into

@@ -28,6 +28,23 @@ public sealed record DuplicateCandidate(
 /// <param name="Files">Every file sharing this hash — always 2 or more.</param>
 public sealed record DuplicateGroup(string Sha256, IReadOnlyList<DuplicateCandidate> Files);
 
+/// <summary>
+/// A file's cached hash results, keyed by path — see <see cref="FileHashCache"/>. Reused across
+/// scans as long as the file's size and last-write time haven't changed, so an unmodified file
+/// is never re-read once it's been through a full scan.
+/// </summary>
+/// <param name="Path">Absolute file path — the cache key.</param>
+/// <param name="SizeBytes">File size at the time these hashes were computed.</param>
+/// <param name="LastWriteTimeUtcTicks">The file's last-write time (UTC, ticks) at that time.</param>
+/// <param name="QuickHash">Hash of the first bytes only (see <see cref="DuplicateScanner"/>'s quick-hash pass), or null if never computed.</param>
+/// <param name="FullHash">Full SHA-256 of the whole file, or null if never computed (most files never need this — only those that already share a size and quick hash with another file).</param>
+public sealed record CachedFileHash(
+    string Path,
+    long SizeBytes,
+    long LastWriteTimeUtcTicks,
+    string? QuickHash,
+    string? FullHash);
+
 /// <summary>Status of an in-progress or last-completed scan, polled by the config page.</summary>
 public sealed class ScanStatus
 {

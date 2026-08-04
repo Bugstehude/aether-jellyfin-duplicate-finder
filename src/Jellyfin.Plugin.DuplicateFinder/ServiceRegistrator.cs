@@ -14,6 +14,9 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton(_ => new DuplicateResultStore(
             Plugin.Instance?.DataFolderPath
                 ?? throw new InvalidOperationException("Duplicate Finder plugin data path is not initialized.")));
+        serviceCollection.AddSingleton(_ => new FileHashCache(
+            Plugin.Instance?.DataFolderPath
+                ?? throw new InvalidOperationException("Duplicate Finder plugin data path is not initialized.")));
         serviceCollection.AddSingleton<DuplicateScanner>();
     }
 }

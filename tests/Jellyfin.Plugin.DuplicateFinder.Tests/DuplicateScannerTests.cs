@@ -47,6 +47,40 @@ public sealed class DuplicateScannerTests
         Assert.Empty(groups);
     }
 
-    private static DuplicateCandidate MakeCandidate(string path) => new(
-        Guid.NewGuid(), path, path, 1, 0, 0, 0, string.Empty);
+    [Fact]
+    public void GroupBySizeGroupsCandidatesSharingASize()
+    {
+        var candidates = new List<DuplicateCandidate>
+        {
+            MakeCandidate("a", sizeBytes: 100),
+            MakeCandidate("b", sizeBytes: 100),
+            MakeCandidate("c", sizeBytes: 200),
+        };
+
+        var groups = DuplicateScanner.GroupBySize(candidates);
+
+        Assert.Equal(2, groups.Count);
+        var sameSize = Assert.Single(groups, g => g.Count == 2);
+        Assert.All(sameSize, c => Assert.Equal(100, c.SizeBytes));
+        var uniqueSize = Assert.Single(groups, g => g.Count == 1);
+        Assert.Equal(200, uniqueSize[0].SizeBytes);
+    }
+
+    [Fact]
+    public void GroupBySizeWithAllDistinctSizesReturnsOnlySingletonGroups()
+    {
+        var candidates = new List<DuplicateCandidate>
+        {
+            MakeCandidate("a", sizeBytes: 100),
+            MakeCandidate("b", sizeBytes: 200),
+        };
+
+        var groups = DuplicateScanner.GroupBySize(candidates);
+
+        Assert.Equal(2, groups.Count);
+        Assert.All(groups, g => Assert.Single(g));
+    }
+
+    private static DuplicateCandidate MakeCandidate(string path, long sizeBytes = 1) => new(
+        Guid.NewGuid(), path, path, sizeBytes, 0, 0, 0, string.Empty);
 }
