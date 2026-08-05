@@ -19,10 +19,15 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+# Deliberately NOT --no-build: this script must never trust an out-of-band build to already
+# match $configuration. It used to (--no-restore --no-build), and a local `dotnet build` run
+# with the default Debug config left bin/Release stale — package-plugin.sh silently packaged
+# an OLD DLL (right version number in build.yaml, wrong code inside) into a real release
+# (v0.2.1.0 shipped 0.2.0.0's code, missing all 13 safety fixes from the code review) before
+# this was caught. `dotnet publish` here always (re)builds Release itself, so the packaged
+# DLL can never drift from source again.
 dotnet publish "$root/src/Jellyfin.Plugin.DuplicateFinder/Jellyfin.Plugin.DuplicateFinder.csproj" \
   --configuration "$configuration" \
-  --no-restore \
-  --no-build \
   --output "$publish_dir"
 
 mkdir -p "$staging_dir" "$package_dir"
