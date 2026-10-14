@@ -40,7 +40,7 @@ jobs:
         run: python3 -m json.tool artifacts/package/manifest.json >/dev/null
       - name: Jellyfin 10.11.11 load smoke test
         run: tools/smoke-jellyfin.sh
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aether-duplicate-finder-plugin
           path: |
